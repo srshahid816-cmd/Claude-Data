@@ -9,7 +9,7 @@ import streamlit as st
 import plotly.graph_objects as go
 
 # ==================== CONFIG ====================
-st.set_page_config(page_title="Pro Crypto Dashboard v12", layout="wide", page_icon="📊")
+st.set_page_config(page_title="Pro Crypto Dashboard v13", layout="wide", page_icon="📊")
 st.markdown("""
 <style>
     div[data-testid="stMetricValue"] {font-size: 1.4rem;}
@@ -45,13 +45,18 @@ GRADE_ORDER = {"A": 0, "B": 1, "C": 2, "SKIP": 3}
 BINANCE = "https://fapi.binance.com"
 OKX = "https://www.okx.com"
 MEXC = "https://contract.mexc.com"
+SPOT_BIN = "https://data-api.binance.vision"  # Binance spot, market-data-only host
 HDRS = {"User-Agent": "Mozilla/5.0 (crypto-dashboard)"}
 
 
 def _get(url, params=None, timeout=12):
-    r = requests.get(url, params=params, timeout=timeout, headers=HDRS)
-    r.raise_for_status()
-    return r.json()
+    for attempt in range(3):
+        r = requests.get(url, params=params, timeout=timeout, headers=HDRS)
+        if r.status_code in (429, 418) and attempt < 2:  # rate limit -> thoda ruk kar retry
+            time.sleep(1.0 + attempt)
+            continue
+        r.raise_for_status()
+        return r.json()
 
 
 def _f(x, default=np.nan):
@@ -203,28 +208,70 @@ def fetch_klines(symbol, limit, src):
     return df
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_spot_map(src):
+    """symbol -> (spot price, spot 24h quote volume). Empty dict = unavailable."""
+    out = {}
+    try:
+        if src == "binance":
+            for d in _get(f"{SPOT_BIN}/api/v3/ticker/24hr"):
+                sy = d.get('symbol', '')
+                if sy.endswith('USDT'):
+                    out[sy] = (_f(d.get('lastPrice')), _f(d.get('quoteVolume'), 0.0))
+        elif src == "okx":
+            d = _get(f"{OKX}/api/v5/market/tickers", {"instType": "SPOT"})
+            if d.get("code") == "0":
+                for x in d["data"]:
+                    iid = x.get("instId", "")
+                    if iid.endswith("-USDT"):
+                        out[iid.replace("-USDT", "USDT")] = (_f(x.get("last")), _f(x.get("volCcy24h"), 0.0))
+    except Exception:
+        pass
+    return out
+
+
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_funding(symbol, src):
+def fetch_perp_info(symbol, src):
+    """Current funding (%), next settlement (ms). None = unavailable."""
     try:
         if src == "binance":
             d = _get(f"{BINANCE}/fapi/v1/premiumIndex", {"symbol": symbol})
-            return float(d["lastFundingRate"]) * 100
+            return {'funding': float(d["lastFundingRate"]) * 100, 'next': int(d.get("nextFundingTime", 0))}
         if src == "okx":
             d = _get(f"{OKX}/api/v5/public/funding-rate", {"instId": symbol[:-4] + "-USDT-SWAP"})
             if d.get("code") == "0" and d.get("data"):
-                return float(d["data"][0]["fundingRate"]) * 100
+                x = d["data"][0]
+                return {'funding': float(x["fundingRate"]) * 100, 'next': int(_f(x.get("fundingTime"), 0))}
         if src == "mexc":
             d = _get(f"{MEXC}/api/v1/contract/funding_rate/{symbol[:-4]}_USDT")
             if d.get("success"):
-                return float(d["data"]["fundingRate"]) * 100
+                return {'funding': float(d["data"]["fundingRate"]) * 100, 'next': 0}
     except Exception:
         pass
     return None
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_funding_hist(symbol, src):
+    """Last settlements (%, ascending). [] = unavailable."""
+    try:
+        if src == "binance":
+            d = _get(f"{BINANCE}/fapi/v1/fundingRate", {"symbol": symbol, "limit": 30})
+            return [float(x['fundingRate']) * 100 for x in sorted(d, key=lambda x: x['fundingTime'])]
+        if src == "okx":
+            d = _get(f"{OKX}/api/v5/public/funding-rate-history",
+                     {"instId": symbol[:-4] + "-USDT-SWAP", "limit": 30})
+            if d.get("code") == "0" and d.get("data"):
+                rows = sorted(d["data"], key=lambda x: int(x['fundingTime']))
+                return [float(x['fundingRate']) * 100 for x in rows]
+    except Exception:
+        pass
+    return []
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_flow(symbol, src):
-    """Taker buy-sell delta per hour (ascending). Empty df = data unavailable."""
+    """Taker buy/sell volume per hour (ascending). Empty df = data unavailable."""
     try:
         if src == "binance":
             d = _get(f"{BINANCE}/futures/data/takerlongshortRatio",
@@ -232,19 +279,80 @@ def fetch_flow(symbol, src):
             if d:
                 df = pd.DataFrame(d)
                 df['ts'] = pd.to_numeric(df['timestamp'])
-                df['delta'] = pd.to_numeric(df['buyVol']) - pd.to_numeric(df['sellVol'])
-                return df[['ts', 'delta']].sort_values('ts').reset_index(drop=True)
+                df['buy'] = pd.to_numeric(df['buyVol'])
+                df['sell'] = pd.to_numeric(df['sellVol'])
+                df['delta'] = df['buy'] - df['sell']
+                return df[['ts', 'buy', 'sell', 'delta']].sort_values('ts').reset_index(drop=True)
         if src == "okx":
             d = _get(f"{OKX}/api/v5/rubik/stat/taker-volume",
                      {"ccy": symbol[:-4], "instType": "CONTRACTS", "period": "1H"})
             if d.get("code") == "0" and d.get("data"):
-                df = pd.DataFrame([r[:3] for r in d["data"]], columns=['ts', 'sellVol', 'buyVol'])
-                df['ts'] = pd.to_numeric(df['ts'])
-                df['delta'] = pd.to_numeric(df['buyVol']) - pd.to_numeric(df['sellVol'])
-                return df[['ts', 'delta']].sort_values('ts').reset_index(drop=True)
+                df = pd.DataFrame([r[:3] for r in d["data"]], columns=['ts', 'sell', 'buy'])
+                for c in ('ts', 'sell', 'buy'):
+                    df[c] = pd.to_numeric(df[c])
+                df['delta'] = df['buy'] - df['sell']
+                return df[['ts', 'buy', 'sell', 'delta']].sort_values('ts').reset_index(drop=True)
     except Exception:
         pass
     return pd.DataFrame()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_ls(symbol, src):
+    """Retail (all accounts) and top-trader (positions) long/short ratio. None = unavailable."""
+    out = {'retail': None, 'top': None}
+    try:
+        if src == "binance":
+            g = _get(f"{BINANCE}/futures/data/globalLongShortAccountRatio",
+                     {"symbol": symbol, "period": "1h", "limit": 1})
+            if g:
+                out['retail'] = float(g[-1]['longShortRatio'])
+        elif src == "okx":
+            d = _get(f"{OKX}/api/v5/rubik/stat/contracts/long-short-account-ratio",
+                     {"ccy": symbol[:-4], "period": "1H"})
+            if d.get("code") == "0" and d.get("data"):
+                out['retail'] = float(d["data"][0][1])
+    except Exception:
+        pass
+    try:
+        if src == "binance":
+            t = _get(f"{BINANCE}/futures/data/topLongShortPositionRatio",
+                     {"symbol": symbol, "period": "1h", "limit": 1})
+            if t:
+                out['top'] = float(t[-1]['longShortRatio'])
+    except Exception:
+        pass
+    return out
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def fetch_depth(symbol, src):
+    """Spread % and order-book imbalance (symmetric price range). None = unavailable."""
+    try:
+        if src == "binance":
+            d = _get(f"{BINANCE}/fapi/v1/depth", {"symbol": symbol, "limit": 100})
+            bids = [(float(p), float(q)) for p, q in d['bids']]
+            asks = [(float(p), float(q)) for p, q in d['asks']]
+        elif src == "okx":
+            d = _get(f"{OKX}/api/v5/market/books", {"instId": symbol[:-4] + "-USDT-SWAP", "sz": 100})
+            if d.get("code") != "0" or not d.get("data"):
+                return None
+            bids = [(float(r[0]), float(r[1])) for r in d['data'][0]['bids']]
+            asks = [(float(r[0]), float(r[1])) for r in d['data'][0]['asks']]
+        else:
+            return None
+        if not bids or not asks:
+            return None
+        mid = (bids[0][0] + asks[0][0]) / 2
+        rng = min(0.01 * mid, mid - bids[-1][0], asks[-1][0] - mid)  # dono taraf barabar range
+        if rng <= 0:
+            return None
+        bd = sum(p * q for p, q in bids if p >= mid - rng)
+        ad = sum(p * q for p, q in asks if p <= mid + rng)
+        imb = (bd - ad) / (bd + ad) if (bd + ad) > 0 else 0.0
+        return {'spread': (asks[0][0] - bids[0][0]) / mid * 100, 'imb': imb, 'range_pct': rng / mid * 100}
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -441,57 +549,218 @@ def why_no_trade(last):
     return r
 
 
-# ==================== DERIVATIVES OVERLAY (veto layer, backtest nahi hota) ====================
-def derivatives_overlay(sym, side, df, src, btc_t4):
-    """Core signal ko sirf ROK sakta hai ya grade ghata sakta hai. Naye points add nahi karta."""
-    checks = []
-    s = 1 if side == 1 else -1
+# ==================== MARKET INTELLIGENCE (derivatives + spot + positioning) ====================
+# Ye reads HEURISTICS hain (price-core ki tarah backtest nahi ho sakte: exchanges sirf ~30 din ka OI/flow/L-S deti hain).
+# Isliye ye sirf grade/veto ke liye use hote hain, trade signal banane ke liye nahi.
+STATE_ICON = {"bull": "🟢 Bullish", "bear": "🔴 Bearish", "neutral": "⚪ Neutral",
+              "info": "ℹ️ Info", "warn": "⚠️ Warning", "na": "❔ No data"}
 
-    f = fetch_funding(sym, src)
-    if f is None:
-        checks.append(("Funding", "na", "DATA UNAVAILABLE"))
-    elif s * f > 0.05:
-        checks.append(("Funding", "bad", f"{f:+.4f}% — trade ki taraf crowded hai"))
+
+def _spot_lookup(sym, smap):
+    for pref, mult in (("1000000", 1e6), ("1000", 1e3)):
+        if sym.startswith(pref) and sym[len(pref):] in smap:
+            return smap[sym[len(pref):]], mult
+    return smap.get(sym), 1.0
+
+
+def _ret(df, bars):
+    if df is None or len(df) <= bars:
+        return None
+    return float(df['close'].iloc[-1] / df['close'].iloc[-1 - bars] - 1)
+
+
+def market_intel(sym, src, df, price, vol_usd, spot_map, btc_df, btc_t4):
+    """Saare parameters ek list mein: name, value, state(bull/bear/neutral/info/warn/na), note."""
+    P = []
+
+    def add(name, short, value, state, note="", counts=True):
+        P.append({'name': name, 'short': short, 'value': value, 'state': state, 'note': note, 'counts': counts})
+
+    ret12, ret24 = _ret(df, OVERLAY_BARS), _ret(df, 24)
+
+    # 1) Funding (futures)
+    info, hist = fetch_perp_info(sym, src), fetch_funding_hist(sym, src)
+    if not info:
+        add("Funding (now)", "Fund", "DATA UNAVAILABLE", "na")
     else:
-        checks.append(("Funding", "ok", f"{f:+.4f}%"))
+        f = info['funding']
+        s_ = "bear" if f > 0.05 else "bull" if f < -0.05 else "neutral"
+        add("Funding (now)", "Fund", f"{f:+.4f}%", s_,
+            {"bear": "longs crowded (contrarian bearish)", "bull": "shorts crowded (contrarian bullish)",
+             "neutral": "normal range"}[s_])
+        if info.get('next', 0) > 0:
+            mins = (info['next'] - time.time() * 1000) / 60000
+            add("Next funding", "Nxt", f"{mins:.0f} min mein" if mins > 0 else "ab", "info",
+                "settlement se pehle entry = funding pay/receive hoti hai", counts=False)
+    if len(hist) >= 6:
+        a, b = float(np.mean(hist[-3:])), float(np.mean(hist[-6:-3]))
+        tr_ = "rising" if a > b + 0.005 else "falling" if a < b - 0.005 else "flat"
+        add("Funding trend", "FTr", f"{a:+.4f}% vs {b:+.4f}% ({tr_})", "info",
+            "last 3 vs pichli 3 settlements", counts=False)
 
-    oi, fl = fetch_oi(sym, src), fetch_flow(sym, src)
-    pc = None
-    if len(df) > OVERLAY_BARS:
-        pc = df['close'].iloc[-1] / df['close'].iloc[-1 - OVERLAY_BARS] - 1
-    if oi.empty or len(oi) <= OVERLAY_BARS or pc is None:
-        checks.append(("OI vs price", "na", "DATA UNAVAILABLE"))
+    # 2) Spot vs futures
+    sp, mult = _spot_lookup(sym, spot_map or {})
+    if sp and np.isfinite(sp[0]) and sp[0] > 0:
+        prem = (price / mult - sp[0]) / sp[0] * 100
+        if abs(prem) > 10:  # itna farq = alag token / galat match
+            add("Spot data", "Spot", "spot symbol match nahi hua", "na", counts=False)
+        else:
+            s_ = "bear" if prem > 0.30 else "bull" if prem < -0.30 else "neutral"
+            add("Perp vs spot premium", "Prem", f"{prem:+.3f}%", s_,
+                "futures spot se mehenge = leverage demand; discount = leverage dar", counts=False)
+            if sp[1] and sp[1] > 0 and vol_usd > 0:
+                add("Perp / spot volume", "P/S", f"{vol_usd / sp[1]:.1f}x", "info",
+                    "zyada = leverage-driven; kam = spot-led (healthier)", counts=False)
     else:
-        oc = oi['oi'].iloc[-1] / oi['oi'].iloc[-1 - OVERLAY_BARS] - 1
-        bad = (s * pc > 0 and oc <= -0.005) or (s * pc < 0 and oc >= 0.005)
-        txt = f"price {pc*100:+.2f}%, OI {oc*100:+.2f}% ({OVERLAY_BARS}h)"
-        checks.append(("OI vs price", "bad" if bad else "ok", txt + (" — kamzor move" if bad else "")))
+        add("Spot data", "Spot", "DATA UNAVAILABLE / spot market nahi", "na", counts=False)
 
+    # 3) Open interest x price quadrant
+    oi = fetch_oi(sym, src)
+    if oi.empty or len(oi) <= OVERLAY_BARS or ret12 is None:
+        add("OI vs price (12h)", "OI", "DATA UNAVAILABLE", "na")
+    else:
+        oc = float(oi['oi'].iloc[-1] / oi['oi'].iloc[-1 - OVERLAY_BARS] - 1)
+        val = f"price {ret12*100:+.2f}%, OI {oc*100:+.2f}%"
+        if abs(oc) < 0.005:
+            add("OI vs price (12h)", "OI", val + " — OI flat", "neutral", "naye positions nahi ban rahe")
+        elif ret12 > 0 and oc > 0:
+            add("OI vs price (12h)", "OI", val + " — LONG BUILDUP", "bull", "naye longs, rally mein dum")
+        elif ret12 < 0 and oc > 0:
+            add("OI vs price (12h)", "OI", val + " — SHORT BUILDUP", "bear", "naye shorts, girawat mein dum")
+        elif ret12 > 0:
+            add("OI vs price (12h)", "OI", val + " — SHORT COVERING", "bear", "rally sirf shorts band hone se: kamzor, fade ho sakti hai")
+        else:
+            add("OI vs price (12h)", "OI", val + " — LONG UNWIND", "bull", "girawat sirf longs band hone se: kamzor, bounce ho sakta hai")
+
+    # 4) Taker flow (CVD proxy)
+    fl = fetch_flow(sym, src)
     if fl.empty or len(fl) < OVERLAY_BARS:
-        checks.append(("Taker flow", "na", "DATA UNAVAILABLE"))
+        add("Taker flow (12h)", "Flow", "DATA UNAVAILABLE", "na")
+        add("CVD vs price", "CVD", "DATA UNAVAILABLE", "na", counts=False)
     else:
-        cvd = float(fl['delta'].tail(OVERLAY_BARS).sum())
-        checks.append(("Taker flow", "ok" if s * cvd > 0 else "bad",
-                       f"net {cvd:,.0f} ({OVERLAY_BARS}h)" + ("" if s * cvd > 0 else " — flow ulta hai")))
+        t = fl.tail(OVERLAY_BARS)
+        buy, sell = float(t['buy'].sum()), float(t['sell'].sum())
+        ratio = buy / sell if sell > 0 else np.nan
+        s_ = "bull" if ratio > 1.05 else "bear" if ratio < 0.95 else "neutral"
+        add("Taker flow (12h)", "Flow", f"buy/sell {ratio:.2f} (net {buy - sell:,.0f})", s_,
+            "aggressive buyers vs sellers")
+        if len(fl) >= 24:
+            t24 = fl.tail(24)
+            r24 = float(t24['buy'].sum() / t24['sell'].sum()) if t24['sell'].sum() > 0 else np.nan
+            add("Taker flow (24h)", "F24", f"buy/sell {r24:.2f}", "info", "12h se compare karo", counts=False)
+        if ret12 is not None and ret12 > 0.005 and ratio < 0.95:
+            add("CVD vs price", "CVD", "price upar, sellers dominate", "bear", "divergence: rally ko buyers support nahi kar rahe", counts=False)
+        elif ret12 is not None and ret12 < -0.005 and ratio > 1.05:
+            add("CVD vs price", "CVD", "price neeche, buyers dominate", "bull", "divergence: girawat mein buyers absorb kar rahe", counts=False)
+        else:
+            add("CVD vs price", "CVD", "price aur flow aligned", "neutral", counts=False)
 
+    # 5) Positioning: retail vs top traders
+    ls = fetch_ls(sym, src)
+    r, tp = ls.get('retail'), ls.get('top')
+    if r is None:
+        add("Retail long/short", "Rtl", "DATA UNAVAILABLE", "na")
+    else:
+        s_ = "bear" if r > 2.0 else "bull" if r < 0.6 else "neutral"
+        add("Retail long/short", "Rtl", f"{r:.2f}", s_, "contrarian: crowd extreme par ulta chalta hai")
+    if tp is None:
+        add("Top traders L/S (positions)", "Top", "DATA UNAVAILABLE (sirf Binance)", "na")
+    else:
+        s_ = "bull" if tp > 1.2 else "bear" if tp < 0.85 else "neutral"
+        add("Top traders L/S (positions)", "Top", f"{tp:.2f}", s_, "bade accounts ke saath chalo (heuristic)")
+    if r is not None and tp is not None:
+        if r > 1.5 and tp < 1.0:
+            add("Smart vs retail", "S/R", "retail long, top traders nahi", "bear", "retail trap ka risk", counts=False)
+        elif r < 0.8 and tp > 1.1:
+            add("Smart vs retail", "S/R", "retail short, top traders long", "bull", "squeeze ka imkaan", counts=False)
+        else:
+            add("Smart vs retail", "S/R", "aligned", "neutral", counts=False)
+
+    # 6) Liquidity / order book
+    dp = fetch_depth(sym, src)
+    if dp is None:
+        add("Spread", "Sprd", "DATA UNAVAILABLE", "na")
+        add("Order-book imbalance", "Book", "DATA UNAVAILABLE", "na", counts=False)
+    else:
+        add("Spread", "Sprd", f"{dp['spread']:.3f}%", "warn" if dp['spread'] > 0.10 else "neutral",
+            "0.10% se zyada = buri fills")
+        s_ = "bull" if dp['imb'] > 0.25 else "bear" if dp['imb'] < -0.25 else "neutral"
+        add("Order-book imbalance", "Book", f"{dp['imb']:+.2f} (±{dp['range_pct']:.2f}% range)", s_,
+            "spoof ho sakta hai: sirf info", counts=False)
+
+    # 7) Relative strength vs BTC
+    if sym == "BTCUSDT" or btc_df is None or len(btc_df) < 80 or len(df) < 80:
+        add("Relative strength vs BTC", "RS", "yehi BTC hai" if sym == "BTCUSDT" else "DATA UNAVAILABLE", "na")
+    else:
+        bs = btc_df.set_index('time')['close']
+        t_now = df['time'].iloc[-1]
+        try:
+            b_now, b24, b72 = bs.loc[t_now], bs.loc[t_now - pd.Timedelta(hours=24)], bs.loc[t_now - pd.Timedelta(hours=72)]
+            c_now, c24, c72 = df['close'].iloc[-1], df['close'].iloc[-25], df['close'].iloc[-73]
+            rs24, rs72 = (c_now / c24 - b_now / b24) * 100, (c_now / c72 - b_now / b72) * 100
+            s_ = "bull" if (rs24 > 1 and rs72 > 0) else "bear" if (rs24 < -1 and rs72 < 0) else "neutral"
+            add("Relative strength vs BTC", "RS", f"24h {rs24:+.2f}%, 72h {rs72:+.2f}%", s_,
+                "coin BTC se mazboot/kamzor (price-based)")
+        except Exception:
+            add("Relative strength vs BTC", "RS", "DATA UNAVAILABLE", "na")
+
+    # 8) BTC market trend
     if sym == "BTCUSDT":
-        checks.append(("BTC 4H trend", "na", "yehi BTC hai"))
-    elif btc_t4 == -s:
-        checks.append(("BTC 4H trend", "bad", "BTC trade ke khilaf hai"))
+        add("BTC 4H trend", "BTC", "yehi BTC hai", "na")
     else:
-        checks.append(("BTC 4H trend", "ok", "khilaf nahi"))
+        add("BTC 4H trend", "BTC", {1: "UP", -1: "DOWN", 0: "NEUTRAL"}[int(btc_t4)],
+            "bull" if btc_t4 == 1 else "bear" if btc_t4 == -1 else "neutral", "alts aksar BTC ke saath chalte hain")
 
-    bad = sum(1 for _, st_, _ in checks if st_ == "bad")
-    known = sum(1 for _, st_, _ in checks if st_ != "na")
-    if known < 2:
-        grade = "C"
-    elif bad == 0:
-        grade = "A"
-    elif bad == 1:
-        grade = "B"
+    # 9) Info-only context
+    if len(df) > 25:
+        vs = float(df['volume'].iloc[-1] / df['volume'].iloc[-21:-1].mean())
+        add("Last-candle volume", "Vol", f"{vs:.2f}x avg20", "info", "breakout ke liye >1.3x", counts=False)
+        a_ = atr(df)
+        rank = float((a_.tail(100) <= a_.iloc[-1]).mean() * 100)
+        add("Volatility (ATR %)", "ATR", f"{a_.iloc[-1] / df['close'].iloc[-1] * 100:.2f}% (pctile {rank:.0f})", "info",
+            "pctile 80+ = volatile, size chhota rakho", counts=False)
+        hi, lo = float(df['high'].tail(24).max()), float(df['low'].tail(24).min())
+        pos = (float(df['close'].iloc[-1]) - lo) / (hi - lo) * 100 if hi > lo else 50.0
+        add("24h range position", "Rng", f"{pos:.0f}%", "info", "0% = 24h low, 100% = 24h high", counts=False)
+    return P
+
+
+def intel_grade(P, side):
+    """A/B/C/SKIP. Sirf counting parameters. Core signal ko sirf ghata sakta hai."""
+    mine, opp = ("bull", "bear") if side == 1 else ("bear", "bull")
+    cp = [p for p in P if p['counts']]
+    good = sum(1 for p in cp if p['state'] == mine)
+    bad = sum(1 for p in cp if p['state'] == opp or p['state'] == 'warn')
+    known = sum(1 for p in cp if p['state'] != 'na')
+    if known < 3:
+        g = "C"
+    elif bad >= 3:
+        g = "SKIP"
+    elif bad == 2:
+        g = "C"
+    elif bad == 0 and good >= 2:
+        g = "A"
     else:
-        grade = "SKIP"
-    return checks, grade
+        g = "B"
+    return g, good, bad, known
+
+
+def intel_marks(P, side):
+    mine, opp = ("bull", "bear") if side == 1 else ("bear", "bull")
+    def m(p):
+        if p['state'] == 'na':
+            return "?"
+        if p['state'] == opp or p['state'] == 'warn':
+            return "✗"
+        return "✓" if p['state'] == mine else "·"
+    return " ".join(f"{p['short']}{m(p)}" for p in P if p['counts'])
+
+
+def _pv(P, name):
+    for p in P:
+        if p['name'] == name:
+            return p['value']
+    return "-"
 
 
 def btc_trend(src):
@@ -501,25 +770,38 @@ def btc_trend(src):
     return int(build_signals(df)['t4'].iloc[-1])
 
 
-def analyze_symbol(sym, src, price, rr, cost_pct, btc_t4, vol_m):
+def analyze_symbol(sym, src, price, rr, cost_pct, btc_t4, vol_usd, spot_map, btc_df):
+    """('signal', row) / ('watch', row) / None."""
     try:
         df = fetch_klines(sym, 498, src)
         if len(df) < 300:
             return None
         d = build_signals(df)
-        if int(d['side'].iloc[-1]) == 0:
+        last = d.iloc[-1]
+        side = int(last['side'])
+        if side == 0:  # setup ban raha hai? (trend + ADX ok, price EMA50 ke paas)
+            t4 = int(last['t4'])
+            if t4 != 0 and last['adx'] > ADX_MIN:
+                dist = (last['close'] - last['ema50']) / last['atr']
+                if (t4 == 1 and last['close'] > last['ema200'] and -0.3 <= dist <= 0.8) or \
+                   (t4 == -1 and last['close'] < last['ema200'] and -0.8 <= dist <= 0.3):
+                    return ('watch', {'Symbol': sym, 'Side': 'LONG' if t4 == 1 else 'SHORT',
+                                      'Price': round(float(last['close']), 6), 'ADX': round(float(last['adx']), 1),
+                                      'EMA50 dist (ATR)': round(float(dist), 2), 'Vol $M': round(vol_usd / 1e6, 1)})
             return None
         plan = live_plan(d, price, rr, cost_pct)
         if plan is None or plan['status'] != 'READY':
             return None
-        checks, grade = derivatives_overlay(sym, plan['side'], df, src, btc_t4)
+        P = market_intel(sym, src, df, price, vol_usd, spot_map, btc_df, btc_t4)
+        grade, good, bad, known = intel_grade(P, plan['side'])
         tr = plan['trade']
-        mark = {"ok": "✓", "bad": "✗", "na": "?"}
-        return {'Symbol': sym, 'Side': 'LONG' if plan['side'] == 1 else 'SHORT', 'Setup': plan['setup'],
-                'Grade': grade, 'Entry': round(tr['entry'], 6), 'SL': round(tr['sl'], 6),
-                'TP': round(tr['tp'], 6), 'Risk %': round(tr['risk_pct'], 2),
-                'ADX': round(float(d['adx'].iloc[-1]), 1), 'Vol $M': round(vol_m, 1),
-                'Checks': " ".join(f"{n.split()[0]}{mark[s_]}" for n, s_, _ in checks)}
+        return ('signal', {'Symbol': sym, 'Side': 'LONG' if plan['side'] == 1 else 'SHORT', 'Setup': plan['setup'],
+                           'Grade': grade, 'Entry': round(tr['entry'], 6), 'SL': round(tr['sl'], 6),
+                           'TP': round(tr['tp'], 6), 'Risk %': round(tr['risk_pct'], 2),
+                           'ADX': round(float(last['adx']), 1), 'Vol $M': round(vol_usd / 1e6, 1),
+                           'Good': good, 'Bad': bad, 'Funding': _pv(P, "Funding (now)"),
+                           'OI read': _pv(P, "OI vs price (12h)"), 'Spot prem': _pv(P, "Perp vs spot premium"),
+                           'Checks': intel_marks(P, plan['side'])})
     except Exception:
         return None
 
@@ -682,8 +964,8 @@ if MODE == "🤖 AI Chatbot":
     st.stop()
 
 # ==================== DASHBOARD ====================
-st.title("📊 Pro Crypto Dashboard v12")
-st.caption(f"Update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Closed candles only | Backtested core + derivatives veto")
+st.title("📊 Pro Crypto Dashboard v13")
+st.caption(f"Update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Closed candles only | Backtested price core + full market intelligence")
 
 CAPITAL = st.sidebar.number_input("💰 Capital ($)", min_value=10.0, value=1000.0, step=100.0)
 RISK_PCT = st.sidebar.number_input("⚠️ Risk per trade (%)", min_value=0.1, max_value=5.0, value=1.0, step=0.25)
@@ -703,44 +985,59 @@ if SRC != "binance":
                f"{SRC.upper()} use ho raha hai. Funding/OI/flow ke kuch checks 'DATA UNAVAILABLE' ho sakte hain.")
 
 # ---------- SCANNER ----------
-with st.expander("🎯 Scanner (sirf backtested setups)", expanded=True):
+st.caption(f"🌐 Universe: {len(tickers)} USDT perpetuals ({SRC.upper()})")
+with st.expander("🎯 Scanner (backtested price core + full derivatives/spot intel)", expanded=True):
     a, b, c = st.columns(3)
-    sc_top = a.selectbox("Top coins (volume)", [20, 40, 80, 120], index=1)
-    sc_vol = b.number_input("Min 24h vol ($M)", 0.0, 1000.0, 30.0, 5.0)
+    sc_top = a.selectbox("Kitne coins scan karein (volume order)", [20, 50, 100, 200, 300, "ALL"], index=2)
+    sc_vol = b.number_input("Min 24h vol ($M)", 0.0, 1000.0, 5.0, 1.0)
     hide_skip = c.checkbox("SKIP grade chhupao", True)
     if st.button("🚀 Scan now", type="primary"):
-        syms = tickers[tickers['volume24'] / 1e6 >= sc_vol]['symbol'].head(sc_top).tolist()
+        pool = tickers[tickers['volume24'] / 1e6 >= sc_vol]
+        syms = pool['symbol'].tolist() if sc_top == "ALL" else pool['symbol'].head(int(sc_top)).tolist()
         if not syms:
             st.warning("Koi coin filter pass nahi hua.")
         else:
-            btc_t4 = btc_trend(SRC)
+            btc_df_s = fetch_klines("BTCUSDT", 498, SRC)
+            btc_t4_s = btc_trend(SRC)
+            spot_s = fetch_spot_map(SRC)
             prog, stat = st.progress(0.0), st.empty()
-            rows = []
-            with ThreadPoolExecutor(max_workers=6) as ex:
-                futs = [ex.submit(analyze_symbol, s, SRC, price_map[s], RR, COST, btc_t4, vol_map[s]) for s in syms]
+            sigs, watch = [], []
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                futs = [ex.submit(analyze_symbol, s_, SRC, price_map[s_], RR, COST, btc_t4_s,
+                                  vol_map[s_] * 1e6, spot_s, btc_df_s) for s_ in syms]
                 for k, f in enumerate(as_completed(futs), 1):
                     prog.progress(k / len(futs))
                     stat.text(f"Scanning... {k}/{len(futs)}")
                     r = f.result()
                     if r:
-                        rows.append(r)
-            stat.text(f"✅ {len(syms)} coins scanned | BTC 4H trend: {['DOWN', 'NEUTRAL', 'UP'][btc_t4 + 1]} | {len(rows)} setups")
-            st.session_state['scan'] = rows
+                        (sigs if r[0] == 'signal' else watch).append(r[1])
+            stat.text(f"✅ {len(syms)} coins | BTC 4H: {['DOWN', 'NEUTRAL', 'UP'][btc_t4_s + 1]} | "
+                      f"{len(sigs)} signals | {len(watch)} forming | spot data: {'ok' if spot_s else 'NA'}")
+            st.session_state['scan'] = sigs
+            st.session_state['watch'] = watch
     rows = st.session_state.get('scan')
     if rows is not None:
         if hide_skip:
             rows = [r for r in rows if r['Grade'] != 'SKIP']
         rows = sorted(rows, key=lambda r: (GRADE_ORDER[r['Grade']], -r['ADX']))
         if not rows:
-            st.info("Abhi koi quality setup nahi. Ye normal hai — most of the time sahi jawab 'no trade' hota hai.")
+            st.info("Abhi koi quality signal nahi. Ye normal hai — most of the time sahi jawab 'no trade' hota hai.")
         else:
             sdf = pd.DataFrame(rows)
             st.subheader(f"🟢 LONG ({int((sdf['Side'] == 'LONG').sum())})")
             st.dataframe(sdf[sdf['Side'] == 'LONG'], hide_index=True)
             st.subheader(f"🔴 SHORT ({int((sdf['Side'] == 'SHORT').sum())})")
             st.dataframe(sdf[sdf['Side'] == 'SHORT'], hide_index=True)
-            st.caption("Grade A = koi derivatives check khilaf nahi | B = 1 khilaf | C = data kam | "
-                       "Checks: ✓ ok, ✗ khilaf, ? data nahi. Scan ke baad bhi price check karo — signal sirf closed candle par valid hai.")
+            st.download_button("⬇️ Scan CSV (forward-test log ke liye)", sdf.to_csv(index=False),
+                               file_name=f"scan_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", mime="text/csv")
+            st.caption("Grade A = 2+ reads saath, 0 khilaf | B = ok | C = 2 khilaf ya data kam | SKIP = 3+ khilaf. "
+                       "Checks: ✓ saath, ✗ khilaf, · neutral, ? data nahi. Signal sirf closed candle par valid hai.")
+    watch = st.session_state.get('watch')
+    if watch:
+        with st.expander(f"👀 Forming setups ({len(watch)}) — trigger candle ka intezar"):
+            st.dataframe(pd.DataFrame(watch).sort_values('ADX', ascending=False), hide_index=True)
+            st.caption("Ye signal NAHI hain. Trend + ADX ok hai aur price EMA50 ke paas pullback zone mein hai. "
+                       "Trigger candle (EMA50 wapas cross + pichli candle ka high/low tootna) bane tab hi signal banta hai.")
 
 st.markdown("---")
 
@@ -777,7 +1074,10 @@ with st.expander("🩺 Data health", expanded=health['age_min'] > 90 or health['
 d = build_signals(df1)
 last = d.iloc[-1]
 plan = live_plan(d, price, RR, COST)
+btc_df = fetch_klines("BTCUSDT", 498, SRC)
 btc_t4 = btc_trend(SRC)
+spot_map = fetch_spot_map(SRC)
+P = market_intel(SYM, SRC, df1, price, vol_map[SYM] * 1e6, spot_map, btc_df, btc_t4)
 
 st.header("🎯 Signal")
 if plan is None:
@@ -792,10 +1092,11 @@ else:
         st.write(plan['note'])
     else:
         tr = plan['trade']
-        checks, grade = derivatives_overlay(SYM, plan['side'], df1, SRC, btc_t4)
+        grade, good, bad, known = intel_grade(P, plan['side'])
         (st.success if grade == "A" else st.warning if grade in ("B", "C") else st.error)(f"## {label} | Grade {grade}")
+        st.caption(f"Market intel: {good} saath | {bad} khilaf | {known} parameters ka data mila")
         if grade == "SKIP":
-            st.write("Derivatives checks mein 2+ khilaf — core signal hone ke bawajood SKIP.")
+            st.write("3+ parameters trade ke khilaf — core signal hone ke bawajood SKIP.")
         a, b = st.columns(2)
         a.metric("Entry", f"${tr['entry']:,.4f}")
         b.metric("Stop Loss", f"${tr['sl']:,.4f}", f"-{tr['risk_pct']:.2f}%")
@@ -816,10 +1117,12 @@ else:
         if sz['lev'] > 10 or not sz['safe']:
             st.error("Leverage zyada / stop liquidation ke qareeb. Position chhoti karo ya zyada margin lagao.")
 
-        st.subheader("🔎 Derivatives checks")
-        icon = {"ok": "✅", "bad": "❌", "na": "❔"}
-        for n, s_, t in checks:
-            st.write(f"{icon[s_]} **{n}**: {t}")
+        opp = "bear" if plan['side'] == 1 else "bull"
+        against = [p for p in P if p['counts'] and (p['state'] == opp or p['state'] == 'warn')]
+        if against:
+            st.subheader("❌ Khilaf parameters")
+            for p in against:
+                st.write(f"❌ **{p['name']}**: {p['value']} — {p['note']}")
 
 st.header("📊 Context")
 a, b = st.columns(2)
@@ -828,6 +1131,21 @@ b.metric("ADX", f"{last['adx']:.1f}", "trending" if last['adx'] > ADX_MIN else "
 a, b = st.columns(2)
 a.metric("RSI", f"{last['rsi']:.1f}")
 b.metric("ATR", f"${last['atr']:,.4f}")
+
+# ---------- MARKET INTELLIGENCE ----------
+st.header("🧠 Market Intelligence")
+bull_n = sum(1 for p in P if p['counts'] and p['state'] == 'bull')
+bear_n = sum(1 for p in P if p['counts'] and p['state'] == 'bear')
+na_n = sum(1 for p in P if p['state'] == 'na')
+a, b = st.columns(2)
+a.metric("🟢 Bullish reads", bull_n)
+b.metric("🔴 Bearish reads", bear_n)
+st.caption(f"{na_n} parameters ka data nahi mila (DATA UNAVAILABLE).")
+st.dataframe(pd.DataFrame([{'Parameter': p['name'], 'Value': p['value'], 'Read': STATE_ICON[p['state']],
+                            'Note': p['note']} for p in P]), hide_index=True)
+st.caption("Ye reads heuristics hain (funding, OI, taker flow, L/S, spot premium, spread, RS vs BTC). "
+           "Inka backtest nahi ho sakta, isliye ye sirf grade/veto karte hain — signal price-core se aata hai. "
+           "Bullish reads zyada hone ka matlab BUY signal nahi hai.")
 
 # ---------- CHART ----------
 cd = d.tail(150)
@@ -855,7 +1173,7 @@ if st.button(f"▶️ {SYM} par backtest"):
         st.dataframe(t.tail(30).iloc[::-1], hide_index=True)
 
 with st.expander("📦 Portfolio backtest (ek coin se zyada bharosemand)"):
-    n_pf = st.selectbox("Top coins", [10, 20, 30], index=0)
+    n_pf = st.selectbox("Top coins", [10, 20, 30, 50], index=1)
     if st.button("▶️ Portfolio backtest"):
         syms = tickers['symbol'].head(n_pf).tolist()
         prog = st.progress(0.0)
@@ -880,15 +1198,14 @@ with st.expander("📦 Portfolio backtest (ek coin se zyada bharosemand)"):
             st.info("Koi trade nahi bana / data nahi aaya.")
 
 st.sidebar.markdown("---")
-st.sidebar.header("✅ v12 changes")
+st.sidebar.header("✅ v13 changes")
 st.sidebar.markdown("""
-1. **Data**: Binance → OKX → MEXC, ek hi venue, source dikhta hai
-2. **pandas_ta hata diya** (own indicators)
-3. **Backtester** (fees ke saath) + portfolio test
-4. **Unproven points hata diye** (OB/FVG/VP/sweep scoring)
-5. **Derivatives = veto layer**, score nahi
-6. **Structure SL** (1–3 ATR), cost filter
-7. **Stale/chase/invalidated** signal detection
+1. **Saare coins scan** (ALL) + forming-setups watchlist
+2. **Spot vs futures**: premium, volume ratio
+3. **Funding** now/trend/next, **OI quadrant**, **taker flow + CVD divergence**
+4. **Retail vs top-trader L/S**, spread, order-book imbalance
+5. **Relative strength vs BTC**, volatility, range position
+6. Grade A/B/C/SKIP + scan CSV (forward-test)
 """)
 if st.sidebar.button("🔄 Refresh Data"):
     st.cache_data.clear()
